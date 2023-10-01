@@ -1,0 +1,190 @@
+---
+title: "representation011023"
+author: "Orm"
+date: '2023-10-01'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(pacman)
+pacman::p_load(tidyverse,
+               cmdstanr,
+               lmerTest,
+               brms,
+               ggridges,
+               wesanderson,
+               tidybayes)
+
+```
+
+## aestectics 
+```{r}
+theme_set(theme_minimal())
+
+c_pos = wes_palette("Rushmore1")[4]
+c_neg = wes_palette('Rushmore1')[1]
+c_neu = wes_palette("Royal1")[1]
+c_line = wes_palette("Rushmore1")[3]
+
+```
+
+## loading and preparing the data
+```{r}
+d_all <- read_csv('ParlaMint_meta.csv')
+
+```
+
+```{r}
+d_g <- d_all %>%
+  mutate(gender_binary = ifelse(Speaker_gender == 'F', 1, 0)) %>% 
+  group_by(country, date) %>% 
+  summarise(N = n(),
+            women = sum(gender_binary),
+            year_cat = as.factor(mean(year)),
+            year = mean(year),
+            proportion = women/N,
+            mAge = mean(Speaker_age, na.rm = T))
+```
+
+# visualising the gender distributions
+
+```{r}
+
+cols <- c(">.5" = c_pos, "<.5" = c_neg, '=.5' = c_neu)
+
+d_g %>% filter(!(country == 'HR' & year %in% c(2016,2020))) %>% 
+  mutate(year_cat = factor(year_cat, levels=sort(unique(d_g$year)))) %>%
+  group_by(country, year) %>% 
+  mutate(c_map = ifelse(mean(proportion) == 0.5, '=.5', ifelse(mean(proportion) > .5, ">.5", '<.5'))) %>% 
+  ggplot(aes(x = proportion, y = year_cat, fill = c_map)) +
+  geom_density_ridges(scale = 3, 
+                      size = 0.3, 
+                      rel_min_height = 0.01, 
+                      quantile_lines = T, 
+                      quantiles = 0.5,
+                      alpha = 0.7,
+                      bandwidth = 0.0348) +
+  scale_fill_manual(values = cols, 
+                    name = "Year mean") +
+  geom_vline(xintercept = 0.5, 
+             color = c_line, 
+             linetype = 2, 
+             alpha = 0.5) +
+  labs(x = 'Proportion (gender)',
+       y = 'Year') +
+  facet_wrap(~country, scale = 'free') +
+  scale_x_continuous(breaks=c(0,0.5,1), lim = c(-0.1, 1.1)) +
+  theme(legend.title.align = 0.5,
+        legend.box.just = "center")
+
+```
+
+## modeling the data
+
+```{r}
+f_full = bf(women | trials(N) ~ 1 + year + (1 + year | country))
+
+get_prior(f_full, data = d_g, family = binomial)
+
+p_gender <- c(
+  prior(normal(0, 1.5), class = Intercept),
+  prior(normal(0, 1.5), class = b),
+  prior(exponential(1), class = sd)
+)
+
+m = brm(formula = f_full, 
+        family = binomial,
+        data = d_g,
+        sample_prior = TRUE,
+        prior = p_gender,
+        backend = "cmdstanr",
+        control = list(adapt_delta = 0.90,
+                       max_treedepth = 20),
+        iter = 4000,
+        chains = 4,
+        core = 4,
+        threads = threading(4),
+        file = 'full_model')
+
+```
+
+```{r}
+sum_m = summary(m)
+sum_m
+
+posterior_m <- posterior_samples(m)
+
+posterior_slice <- posterior_m %>% 
+  slice(1:100)
+```
+
+## visualising model output
+
+```{r}
+cols_mAge <- c(">0.0" = c_pos, "<0.0" = c_neg, '=0.0' = c_neu)
+
+posterior_slice %>% pivot_longer(c('b_year', names(posterior_slice)[23:39]), 
+                                 names_to = 'Country', 
+                                 values_to = 'proportion') %>% 
+  mutate(Country = ifelse(Country == 'b_year', 'Europe', gsub("[^A-Z]","", Country))) %>% 
+  group_by(as.factor(Country)) %>% 
+  mutate(c_map = ifelse(round(mean(proportion),2) == 0, '=0.0', ifelse(round(mean(proportion),2) > 0, ">0.0", '<0.0'))) %>% 
+  ggplot(aes(x = proportion, y = Country, fill = c_map)) + 
+  geom_density_ridges(alpha = 0.7,
+                      rel_min_height = 0.001,
+                      quantile_lines = T, 
+                      quantiles = 0.5) +
+  scale_fill_manual(values = cols_mAge, 
+                    name = "Estimation") +
+  geom_vline(xintercept = 0, color = c_line, linetype = 2, alpha = 0.5) +
+  labs(x = "Estimated change (logit)",
+       title = "a)") 
+
+```
+
+```{r}
+ce <- conditional_effects(
+  m,
+  effects = "year:country",
+  re_formula = NULL
+)
+
+cols_mCE <- c("Increasing" = c_pos, "Decreasing" = c_neg, 'Neutral' = c_neu)
+
+p = plot(ce)[[1]] +
+  facet_wrap("country")
+
+p
+
+ggplot() +
+  geom_point(data = d_plot %>% filter(!(country == 'HR' & year %in% c(2016,2020))), aes(x = year, y = gender), shape = 1) +
+  geom_smooth(data = p[['data']] %>% mutate(trend = 
+           ifelse(
+             country == 'BG', 'Neutral',
+             ifelse(country == 'PL' |
+                      country == 'NL' |
+                      country == 'LV' |
+                      country == 'IT' |
+                      country == 'HU' |
+                      country == 'GB' |
+                      country == 'FR' |
+                      country == 'DK' |
+                      country == 'BE', 'Increasing', 'Decreasing'))), aes(x = year, 
+                                                            y = estimate__, 
+                                                            color = trend)) +
+  scale_color_manual(values = cols_mCE, 
+                    name = "Trend") +
+  geom_hline(yintercept = 0.5,
+             color = c_line,
+             alpha = 0.5,
+             linetype = 2) +
+  facet_wrap( ~ country, scales = 'free_x') +
+  labs(y = "Gender representation", 
+       x = "Year",
+       title = "b)")
+
+```
